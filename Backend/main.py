@@ -1,20 +1,24 @@
 import os
 import re
 import subprocess
-import json
-from flask import Flask, request, jsonify
+import threading
+import firebase_admin
+from firebase_admin import credentials, firestore
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from dotenv import load_dotenv
-import openai
 from langchain_openai import AzureChatOpenAI
-from gradio_client import Client
 
 # Load environment variables
 load_dotenv()
-OPENAI_API_VERSION = os.getenv("OPEN_API_VERSION")
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+FIREBASE_CREDENTIALS_PATH = "firebase_credentials.json"
+
+# Initialize Firebase Admin SDK
+cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
+firebase_admin.initialize_app(cred)
+db = firestore.client()
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -23,13 +27,12 @@ CORS(app)
 # Azure OpenAI Client
 llm = AzureChatOpenAI(
     azure_deployment="gpt-4",
-    openai_api_version=os.getenv("OPENAI_API_VERSION"),
-    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-    openai_api_key=os.getenv("AZURE_OPENAI_KEY"),
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    openai_api_key=AZURE_OPENAI_KEY,
     api_version="2023-12-01-preview"
 )
 
-# Helper function to extract the largest Python code block
+# Extract the largest Python code block
 def extract_largest_code_block(text):
     matches = re.findall(r"```python(.*?)```", text, re.DOTALL)
     return max(matches, key=len).strip() if matches else ""
@@ -39,7 +42,7 @@ def extract_class_name(code):
     match = re.search(r'class\s+(\w+)\s*\(.*Scene.*\)', code)
     return match.group(1) if match else None
 
-# Generate Manim code with refinement
+# Generate Manim code
 def generate_manim_code(prompt):
     messages = [{"role": "user", "content": f"Generate Manim code: {prompt}"}]
     response = llm.invoke(messages)
@@ -54,22 +57,35 @@ def generate_manim_code(prompt):
 
     return {"code": manim_code, "class_name": class_name}
 
-# Run Manim script and generate animation
-def run_manim_script(manim_code, class_name):
-    script_path = "generated_script.py"
-    output_path = "static/animation.mp4"
+# Run Manim script and save video locally
+def run_manim_script(manim_code, class_name, doc_id):
+    script_filename = f"generated_{doc_id}.py"
+    output_filename = f"animation_{doc_id}.mp4"
+    script_path = os.path.join("generated_scripts", script_filename)
+    output_path = os.path.join("static", output_filename)
+
+    os.makedirs("generated_scripts", exist_ok=True)
+    os.makedirs("static", exist_ok=True)
     
     with open(script_path, "w", encoding="utf-8") as f:
         f.write(manim_code)
     
     try:
-        subprocess.run(
-            ["manim", script_path, class_name, "-o", output_path, "--format=mp4"],
-            check=True, capture_output=True, text=True
-        )
-        return {"video_url": f"/static/animation.mp4"}
+        subprocess.run([
+            "manim", script_path, class_name, "-o", output_path, "--format=mp4"
+        ], check=True, capture_output=True, text=True)
+
+        # Store video file path in Firestore
+        db.collection("manim_videos").document(doc_id).update({
+            "status": "completed",
+            "video_path": output_filename  # Store only the filename
+        })
+        
     except subprocess.CalledProcessError as e:
-        return {"error": f"Manim execution failed: {e.stderr}"}
+        db.collection("manim_videos").document(doc_id).update({
+            "status": "failed",
+            "error": str(e.stderr)
+        })
 
 # API Route to generate Manim animation
 @app.route("/api/generate_manim", methods=["POST"])
@@ -78,22 +94,34 @@ def generate_manim():
     prompt = data.get("prompt", "")
     if not prompt:
         return jsonify({"error": "Prompt is required."}), 400
-
+    
     result = generate_manim_code(prompt)
     if "error" in result:
         return jsonify(result), 500
     
-    return jsonify(run_manim_script(result["code"], result["class_name"]))
+    doc_ref = db.collection("manim_videos").add({
+        "prompt": prompt,
+        "status": "processing",
+        "video_path": None
+    })
+    
+    doc_id = doc_ref[1].id  # Get Firestore document ID
+    threading.Thread(target=run_manim_script, args=(result["code"], result["class_name"], doc_id)).start()
+    
+    return jsonify({"message": "Video is being generated", "id": doc_id})
 
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({"message": "Server is running!"}), 200
+# API Route to fetch video status
+@app.route("/api/video_status/<doc_id>", methods=["GET"])
+def video_status(doc_id):
+    doc = db.collection("manim_videos").document(doc_id).get()
+    if doc.exists:
+        return jsonify(doc.to_dict())
+    return jsonify({"error": "Video not found"}), 404
 
-
-# Sample test route
-@app.route("/api/text", methods=["GET"])
-def get_text():
-    return jsonify({"message": "Hello, World!"})
+# API Route to serve generated videos
+@app.route("/static/<filename>", methods=["GET"])
+def serve_video(filename):
+    return send_from_directory("static", filename)
 
 # Run the app
 if __name__ == "__main__":
